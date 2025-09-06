@@ -1,0 +1,55 @@
+name: Build & Release Burp Extension
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK 22 (Corretto)
+        uses: actions/setup-java@v3
+        with:
+          java-version: '22'
+          distribution: 'corretto'
+
+      - name: Grant Gradle execute permission
+        run: chmod +x gradlew
+
+      - name: Build extension
+        run: gradle clean build
+
+      - name: Read Gradle properties
+        id: props
+        run: |
+          ARCHIVES_BASENAME=$(grep '^archivesBaseName=' gradle.properties | cut -d'=' -f2)
+          VERSION=$(grep '^version=' gradle.properties | cut -d'=' -f2)
+          echo "basename=$ARCHIVES_BASENAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Delete existing release and tag
+        run: |
+          gh release delete v${{ steps.props.outputs.version }} -y || true
+          git push origin :refs/tags/v${{ steps.props.outputs.version }} || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Create or update GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ steps.props.outputs.version }}
+          name: v${{ steps.props.outputs.version }}
+          allowUpdates: true
+          replacesArtifacts: true
+          artifacts: build/libs/${{ steps.props.outputs.basename }}-${{ steps.props.outputs.version }}.jar
+          token: ${{ secrets.GH_PAT }}
+          body: |
+            Warning: I never know what I'm doing.
