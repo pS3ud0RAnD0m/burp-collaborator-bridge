@@ -9,34 +9,22 @@ import burp.api.montoya.collaborator.Interaction;
 import burp.api.montoya.collaborator.InteractionFilter;
 import burp.api.montoya.collaborator.PayloadOption;
 
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpServer;
-import com.sun.net.httpserver.HttpsConfigurator;
-import com.sun.net.httpserver.HttpsServer;
-
-import javax.net.ssl.KeyManager;
-import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.X509ExtendedKeyManager;
-import javax.net.ssl.X509KeyManager;
-import javax.net.ssl.SSLEngine;
-
-import java.io.FileInputStream;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.security.KeyStore;
-import java.security.Principal;
-import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -50,107 +38,104 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Embedded HTTP/HTTPS bridge around Burp Collaborator.
+ * Minimal HTTP/1.1 server (no jdk.httpserver dependency).
  *
  * Endpoints:
- *   GET  /v1/health
- *   GET  /v1/payloads  | POST /v1/payloads     (custom, without_server=1)
- *   GET  /v1/interactions                       (payload, id, since, types, limit)
+ *   GET  /health
+ *   GET  /payloads | POST /payloads  (custom, without_server=1)
+ *   GET  /interactions             (payload, id, since, types, limit)
  *
- * Notes:
- * - API key is optional. If set, requests must include the header name/value.
- * - HTTPS is optional. If enabled, provide a PKCS#12 keystore path and password.
- * - State is guarded via a private lock to avoid thread-safety warnings.
+ * Single-request per connection; the socket is closed after each response.
  */
 public final class HttpBridgeServer {
 
     private static final String CONTENT_TYPE_JSON = "application/json; charset=utf-8";
-    private static final String ERR_UNAUTHORIZED   = "unauthorized";
-    private static final String ERR_DISABLED       = "collaborator_disabled";
-    private static final int DEFAULT_BACKLOG       = 0;
+    private static final String ERR_DISABLED = "collaborator_disabled";
+
+    private static final int MAX_START_LINE = 8192;
+    private static final int MAX_HEADER_LINE = 8192;
+    private static final int MAX_HEADERS = 200;
+    private static final int MAX_BODY = 1_000_000; // 1MB cap for POST body
+    private static final int ACCEPT_SO_TIMEOUT_MS = 0;      // blocking accept
+    private static final int SOCKET_SO_TIMEOUT_MS = 15_000; // read timeout per client
 
     private final MontoyaApi api;
-
     private final String bindHost;
-    private final int    bindPort;
-
-    private final String apiKeyHeaderName;
-    private final String apiKey; // optional
-
-    private final boolean useHttps;
-    private final String  p12Path;     // required if useHttps
-    private final String  p12Password; // required if useHttps
-    private final String  keyAlias;    // optional
+    private final int bindPort;
 
     // guarded by stateLock
+    private final Object stateLock = new Object();
+    private volatile boolean running;
     private CollaboratorClient client;
-    private HttpServer         server;
-    private ExecutorService    executor;
-    private final Object       stateLock = new Object();
+    private ServerSocket serverSocket;
+    private ExecutorService executor;
+    private Thread acceptThread;
 
-    public HttpBridgeServer(MontoyaApi api,
-                            String bindHost,
-                            int bindPort,
-                            String apiKeyHeaderName,
-                            String apiKey,
-                            boolean useHttps,
-                            String p12Path,
-                            String p12Password,
-                            String keyAlias) {
+    public HttpBridgeServer(MontoyaApi api, String bindHost, int bindPort) {
         this.api = api;
         this.bindHost = bindHost;
         this.bindPort = bindPort;
-        this.apiKeyHeaderName = (apiKeyHeaderName == null || apiKeyHeaderName.isBlank()) ? "X-API-Key" : apiKeyHeaderName;
-        this.apiKey = apiKey == null ? "" : apiKey;
-
-        this.useHttps = useHttps;
-        this.p12Path = p12Path == null ? "" : p12Path;
-        this.p12Password = p12Password == null ? "" : p12Password;
-        this.keyAlias = keyAlias == null ? "" : keyAlias;
     }
 
     public void start() throws IOException {
         synchronized (stateLock) {
-            if (server != null) return; // already running
+            if (running) return;
 
-            // Throws IllegalStateException if Collaborator is disabled.
+            Logger.logInfo("Runtime: java.version=" + System.getProperty("java.version")
+                    + " java.vendor=" + System.getProperty("java.vendor")
+                    + " os.name=" + System.getProperty("os.name")
+                    + " os.arch=" + System.getProperty("os.arch"));
+
+            Logger.logInfo("Creating Collaborator client ...");
             this.client = api.collaborator().createClient();
+            Logger.logInfo("Collaborator client created.");
 
-            if (useHttps) {
-                this.server = createHttpsServer(bindHost, bindPort, p12Path, p12Password, keyAlias);
-            } else {
-                this.server = HttpServer.create(new InetSocketAddress(bindHost, bindPort), DEFAULT_BACKLOG);
-            }
+            preflightBind(bindHost, bindPort);
 
-            this.executor = Executors.newFixedThreadPool(4);
-            this.server.setExecutor(executor);
+            Logger.logInfo("Opening ServerSocket on " + httpUrlForLog(bindHost, bindPort) + " ...");
+            this.serverSocket = new ServerSocket();
+            this.serverSocket.setReuseAddress(true);
+            this.serverSocket.bind(new InetSocketAddress(InetAddress.getByName(bindHost), bindPort));
+            this.serverSocket.setSoTimeout(ACCEPT_SO_TIMEOUT_MS);
 
-            server.createContext("/v1/health", this::handleHealth);
-            server.createContext("/v1/payloads", this::handlePayloads);
-            server.createContext("/v1/interactions", this::handleInteractions);
+            this.executor = Executors.newFixedThreadPool(8);
+            this.running = true;
 
-            server.start();
+            this.acceptThread = new Thread(this::acceptLoop, "collab-bridge-accept");
+            this.acceptThread.setDaemon(true);
+            this.acceptThread.start();
+
+            Logger.logInfo("Listening on " + httpUrlForLog(bindHost, bindPort));
         }
-        Logger.logInfo("Collaborator bridge listening on " + (useHttps ? "https" : "http") +
-                "://" + bindHost + ":" + bindPort);
     }
 
     public void stop() {
         synchronized (stateLock) {
-            stopHttpServer();
-            shutdownExecutor();
+            running = false;
+            try {
+                if (serverSocket != null && !serverSocket.isClosed()) {
+                    serverSocket.close(); // unblocks accept()
+                }
+            } catch (IOException e) {
+                Logger.logError("ServerSocket close error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+            try {
+                if (executor != null) executor.shutdownNow();
+            } catch (Exception e) {
+                Logger.logError("Executor shutdown error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+            serverSocket = null;
+            executor = null;
             client = null;
+            acceptThread = null;
+            Logger.logInfo("HTTP server stopped.");
         }
     }
 
     public boolean isRunning() {
         synchronized (stateLock) {
-            return server != null;
+            return running;
         }
-    }
-
-    public boolean isHttps() {
-        return useHttps;
     }
 
     public String bindHost() {
@@ -161,47 +146,80 @@ public final class HttpBridgeServer {
         return bindPort;
     }
 
-    // ------------------- Handlers -------------------
+    // --------------------- Accept loop ---------------------
 
-    private void handleHealth(HttpExchange ex) throws IOException {
-        if (isUnauthorized(ex)) return;
-        respondJson(ex, 200, "{\"status\":\"ok\"}");
+    private void acceptLoop() {
+        Logger.logInfo("Accept loop started.");
+        while (running) {
+            try {
+                final Socket s = serverSocket.accept();
+                s.setSoTimeout(SOCKET_SO_TIMEOUT_MS);
+                executor.submit(() -> handleClient(s));
+            } catch (SocketException se) {
+                if (running) {
+                    Logger.logError("Accept SocketException: " + se.getMessage());
+                }
+                break;
+            } catch (IOException ioe) {
+                if (running) {
+                    Logger.logError("Accept IOException: " + ioe.getMessage());
+                }
+            } catch (Exception e) {
+                if (running) {
+                    Logger.logError("Accept unexpected error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            }
+        }
+        Logger.logInfo("Accept loop exiting.");
     }
 
-    private void handlePayloads(HttpExchange ex) throws IOException {
-        if (isUnauthorized(ex)) return;
+    // --------------------- Client handling ---------------------
 
+    private void handleClient(Socket socket) {
+        try (Socket s = socket;
+             InputStream rawIn = new BufferedInputStream(s.getInputStream());
+             OutputStream rawOut = new BufferedOutputStream(s.getOutputStream())) {
+
+            HttpRequest req = parseRequest(rawIn);
+            if (req == null) return;
+
+            String pathOnly = req.path(); // already without query
+            switch (pathOnly) {
+                case "/health":
+                    writeJson(rawOut, 200, "{\"status\":\"ok\"}");
+                    return;
+                case "/payloads":
+                    handlePayloads(req, rawOut);
+                    return;
+                case "/interactions":
+                    handleInteractions(req, rawOut);
+                    return;
+                default:
+                    writeJson(rawOut, 404, errorJson("not_found"));
+            }
+        } catch (Exception e) {
+            Logger.logError("Client handler error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private void handlePayloads(HttpRequest req, OutputStream out) throws IOException {
         final CollaboratorClient c;
         synchronized (stateLock) { c = client; }
         if (c == null) {
-            respondError(ex, 503, ERR_DISABLED);
+            writeJson(out, 503, errorJson(ERR_DISABLED));
             return;
         }
 
         try {
-            Map<String, String> q = new HashMap<>(parseQuery(ex.getRequestURI().getRawQuery()));
-            if ("POST".equalsIgnoreCase(ex.getRequestMethod())) {
-                q.putAll(parseJsonObjectFlat(readBody(ex)));
+            Map<String, String> q = new HashMap<>(req.query());
+            if ("POST".equals(req.method())) {
+                q.putAll(parseJsonObjectFlat(req.body()));
             }
 
             String custom = trimToEmpty(q.get("custom"));
             boolean withoutServer = "1".equals(q.get("without_server"));
 
-            CollaboratorPayload payload;
-            if (!custom.isEmpty()) {
-                // Collaborator custom data is alphanumeric and up to 16 chars.
-                if (!custom.matches("^[A-Za-z0-9]{1,16}$")) {
-                    respondError(ex, 400, "invalid_custom");
-                    return;
-                }
-                payload = withoutServer
-                        ? c.generatePayload(custom, PayloadOption.WITHOUT_SERVER_LOCATION)
-                        : c.generatePayload(custom);
-            } else {
-                payload = withoutServer
-                        ? c.generatePayload(PayloadOption.WITHOUT_SERVER_LOCATION)
-                        : c.generatePayload();
-            }
+            CollaboratorPayload payload = createPayload(c, custom, withoutServer);
 
             StringBuilder sb = new StringBuilder(128);
             sb.append('{');
@@ -217,27 +235,46 @@ public final class HttpBridgeServer {
                 jsonField(sb, "serverLocation", loc.toString());
             });
             sb.append('}');
-            respondJson(ex, 200, sb.toString());
-        } catch (IllegalStateException e) {
-            respondError(ex, 503, ERR_DISABLED);
+            writeJson(out, 200, sb.toString());
+        } catch (IllegalStateException _ ) {
+            writeJson(out, 503, errorJson(ERR_DISABLED));
+        } catch (IllegalArgumentException bad) {
+            if ("invalid_custom".equals(bad.getMessage())) {
+                writeJson(out, 400, errorJson("invalid_custom"));
+            } else {
+                writeJson(out, 400, errorJson("bad_request"));
+            }
         } catch (Exception e) {
-            Logger.logError("payloads handler error: " + e);
-            respondError(ex, 500, "server_error");
+            Logger.logError("payloads handler error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            writeJson(out, 500, errorJson("server_error"));
         }
     }
 
-    private void handleInteractions(HttpExchange ex) throws IOException {
-        if (isUnauthorized(ex)) return;
+    private static CollaboratorPayload createPayload(CollaboratorClient c, String custom, boolean withoutServer) {
+        if (!trimToEmpty(custom).isEmpty()) {
+            if (!custom.matches("^[A-Za-z0-9]{1,16}$")) {
+                throw new IllegalArgumentException("invalid_custom");
+            }
+            return withoutServer
+                    ? c.generatePayload(custom, PayloadOption.WITHOUT_SERVER_LOCATION)
+                    : c.generatePayload(custom);
+        }
+        return withoutServer
+                ? c.generatePayload(PayloadOption.WITHOUT_SERVER_LOCATION)
+                : c.generatePayload();
+    }
 
+    private void handleInteractions(HttpRequest req, OutputStream out) throws IOException {
         final CollaboratorClient c;
         synchronized (stateLock) { c = client; }
         if (c == null) {
-            respondError(ex, 503, ERR_DISABLED);
+            writeJson(out, 503, errorJson(ERR_DISABLED));
             return;
         }
 
         try {
-            Map<String, String> q = parseQuery(ex.getRequestURI().getRawQuery());
+            Map<String, String> q = req.query();
+
             String byPayload = trimToEmpty(q.get("payload"));
             String byId      = trimToEmpty(q.get("id"));
             String typesCsv  = trimToEmpty(q.get("types")).toLowerCase(Locale.ROOT);
@@ -248,7 +285,7 @@ public final class HttpBridgeServer {
             if (!sinceRaw.isEmpty()) {
                 since = parseSince(sinceRaw);
                 if (since == null) {
-                    respondError(ex, 400, "invalid_since");
+                    writeJson(out, 400, errorJson("invalid_since"));
                     return;
                 }
             }
@@ -262,191 +299,132 @@ public final class HttpBridgeServer {
             }
 
             String json = interactionsToJson(filtered);
-            respondJson(ex, 200, json);
-        } catch (IllegalStateException e) {
-            respondError(ex, 503, ERR_DISABLED);
+            writeJson(out, 200, json);
+        } catch (IllegalStateException _ ) {
+            writeJson(out, 503, errorJson(ERR_DISABLED));
         } catch (Exception e) {
-            Logger.logError("interactions handler error: " + e);
-            respondError(ex, 500, "server_error");
+            Logger.logError("interactions handler error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            writeJson(out, 500, errorJson("server_error"));
         }
     }
 
-    // ------------------- Auth / Server lifecycle -------------------
+    // --------------------- HTTP helpers ---------------------
 
-    private boolean isUnauthorized(HttpExchange ex) throws IOException {
-        if (apiKey == null || apiKey.isEmpty()) return false;
-        String hdr = ex.getRequestHeaders().getFirst(apiKeyHeaderName);
-        if (apiKey.equals(hdr)) return false;
-        respondError(ex, 401, ERR_UNAUTHORIZED);
-        return true;
-    }
+    private record HttpRequest(
+            String method,
+            String path,
+            String version,
+            Map<String, String> headers,
+            Map<String, String> query,
+            String body
+    ) {}
 
-    private void stopHttpServer() {
-        try {
-            if (server != null) {
-                server.stop(0);
-                server = null;
+    private HttpRequest parseRequest(InputStream in) throws IOException {
+        String start = readLine(in, MAX_START_LINE);
+        if (start == null || start.isEmpty()) return null;
+
+        String[] parts = start.split(" ", 3);
+        if (parts.length < 3) return null;
+        String method  = parts[0].toUpperCase(Locale.ROOT);
+        String uri     = parts[1];
+        String version = parts[2];
+
+        Map<String, String> headers = new HashMap<>();
+        for (int i = 0; i < MAX_HEADERS; i++) {
+            String line = readLine(in, MAX_HEADER_LINE);
+            if (line == null) return null;
+            if (line.isEmpty()) break;
+            int idx = line.indexOf(':');
+            if (idx > 0) {
+                String k = line.substring(0, idx).trim().toLowerCase(Locale.ROOT);
+                String v = line.substring(idx + 1).trim();
+                headers.put(k, v);
             }
-        } catch (Exception e) {
-            Logger.logError("HTTP server stop error: " + e);
         }
-    }
 
-    private void shutdownExecutor() {
-        try {
-            if (executor != null) {
-                executor.shutdownNow();
-                executor = null;
+        String path = uri;
+        String rawQuery = null;
+        int qIdx = uri.indexOf('?');
+        if (qIdx >= 0) {
+            path = uri.substring(0, qIdx);
+            rawQuery = uri.substring(qIdx + 1);
+        }
+
+        int contentLen = 0;
+        if ("POST".equals(method) || "PUT".equals(method)) {
+            String cl = headers.get("content-length");
+            if (cl != null) {
+                try { contentLen = Integer.parseInt(cl.trim()); } catch (NumberFormatException _ ) { /* ignore */ }
             }
-        } catch (Exception e) {
-            Logger.logError("Executor shutdown error: " + e);
+            if (contentLen < 0 || contentLen > MAX_BODY) {
+                return new HttpRequest(method, path, version, headers, parseQuery(rawQuery), "");
+            }
         }
+
+        String body = "";
+        if (contentLen > 0) {
+            byte[] buf = in.readNBytes(contentLen);
+            body = new String(buf, StandardCharsets.UTF_8);
+        }
+
+        return new HttpRequest(method, path, version, headers, parseQuery(rawQuery), body);
     }
 
-    private static HttpsServer createHttpsServer(String host, int port, String p12Path, String p12Password, String alias) throws IOException {
-        try {
-            SSLContext ctx = buildSslContext(p12Path, p12Password, alias);
-            HttpsServer https = HttpsServer.create(new InetSocketAddress(host, port), DEFAULT_BACKLOG);
-            https.setHttpsConfigurator(new HttpsConfigurator(ctx));
-            return https;
-        } catch (Exception e) {
-            throw new IOException("Failed to initialize HTTPS: " + e.getMessage(), e);
-        }
-    }
-
-    private static SSLContext buildSslContext(String p12Path, String p12Password, String alias) throws Exception {
-        KeyStore ks = KeyStore.getInstance("PKCS12");
-        try (FileInputStream fis = new FileInputStream(p12Path)) {
-            ks.load(fis, p12Password.toCharArray());
-        }
-
-        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        kmf.init(ks, p12Password.toCharArray());
-        KeyManager[] kms = kmf.getKeyManagers();
-
-        if (alias != null && !alias.isBlank()) {
-            for (int i = 0; i < kms.length; i++) {
-                if (kms[i] instanceof X509KeyManager xkm) {
-                    kms[i] = new FixedAliasKeyManager(xkm, alias);
+    private static String readLine(InputStream in, int maxLen) throws IOException {
+        StringBuilder sb = new StringBuilder(80);
+        int prev = -1;
+        for (int i = 0; i < maxLen; i++) {
+            int b = in.read();
+            if (b == -1) break;
+            if (b == '\n') {
+                int end = sb.length();
+                if (end > 0 && prev == '\r') {
+                    sb.setLength(end - 1); // trim trailing \r
                 }
+                return sb.toString();
             }
+            sb.append((char) b);
+            prev = b;
         }
-
-        SSLContext ctx = SSLContext.getInstance("TLS");
-        ctx.init(kms, null, null);
-        return ctx;
+        return sb.isEmpty() ? null : sb.toString();
     }
 
-    /**
-     * Key manager that always prefers a specific alias when the engine/socket selects a server key.
-     */
-    private static final class FixedAliasKeyManager extends X509ExtendedKeyManager {
-        private final X509KeyManager delegate;
-        private final String alias;
-
-        FixedAliasKeyManager(X509KeyManager delegate, String alias) {
-            this.delegate = delegate;
-            this.alias = alias;
-        }
-
-        @Override
-        public String chooseEngineServerAlias(String keyType, Principal[] issuers, SSLEngine engine) {
-            return alias;
-        }
-
-        @Override
-        public String chooseServerAlias(String keyType, Principal[] issuers, Socket socket) {
-            return alias;
-        }
-
-        @Override
-        public X509Certificate[] getCertificateChain(String alias) {
-            return delegate.getCertificateChain(alias);
-        }
-
-        @Override
-        public String[] getClientAliases(String keyType, Principal[] issuers) {
-            return delegate.getClientAliases(keyType, issuers);
-        }
-
-        @Override
-        public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
-            return delegate.chooseClientAlias(keyType, issuers, socket);
-        }
-
-        @Override
-        public String[] getServerAliases(String keyType, Principal[] issuers) {
-            return delegate.getServerAliases(keyType, issuers);
-        }
-
-        @Override
-        public java.security.PrivateKey getPrivateKey(String alias) {
-            return delegate.getPrivateKey(alias);
-        }
+    private static void writeJson(OutputStream out, int code, String body) throws IOException {
+        byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+        String headers =
+                "HTTP/1.1 " + code + " " + reasonPhrase(code) + "\r\n" +
+                        "Content-Type: " + CONTENT_TYPE_JSON + "\r\n" +
+                        "Content-Length: " + payload.length + "\r\n" +
+                        "Connection: close\r\n" +
+                        "\r\n";
+        out.write(headers.getBytes(StandardCharsets.US_ASCII));
+        out.write(payload);
+        out.flush();
     }
 
-    // ------------------- Parsing / JSON helpers -------------------
-
-    private static Integer parsePositiveInt(String s) {
-        if (s.isEmpty()) return null;
-        try {
-            int v = Integer.parseInt(s);
-            return v > 0 ? v : null;
-        } catch (NumberFormatException e) {
-            return null;
-        }
+    private static String reasonPhrase(int code) {
+        return switch (code) {
+            case 400 -> "Bad Request";
+            case 404 -> "Not Found";
+            case 500 -> "Internal Server Error";
+            case 503 -> "Service Unavailable";
+            default -> "OK";
+        };
     }
 
-    private static Set<String> parseTypes(String csv) {
-        if (csv.isEmpty()) return Collections.emptySet();
-        Set<String> out = new HashSet<>();
-        for (String t : csv.split(",")) {
-            String v = t.trim();
-            if (!v.isEmpty()) out.add(v);
-        }
-        return out;
+    private static String errorJson(String code) {
+        return "{\"error\":\"" + escape(code) + "\"}";
     }
 
-    private static List<Interaction> fetchInteractions(CollaboratorClient c, String byPayload, String byId) {
-        if (!byPayload.isEmpty()) {
-            return c.getInteractions(InteractionFilter.interactionPayloadFilter(byPayload));
-        }
-        if (!byId.isEmpty()) {
-            return c.getInteractions(InteractionFilter.interactionIdFilter(byId));
-        }
-        return c.getAllInteractions();
-    }
+    // --------------------- Business helpers ---------------------
 
-    private static List<Interaction> filterInteractions(List<Interaction> in, ZonedDateTime since, Set<String> types) {
-        List<Interaction> out = new ArrayList<>(in.size());
-        for (Interaction i : in) {
-            boolean timeOk = (since == null) || !i.timeStamp().isBefore(since);
-            boolean typeOk = types.isEmpty() || types.contains(classifyType(i));
-            if (timeOk && typeOk) {
-                out.add(i);
-            }
-        }
-        out.sort(Comparator.comparing(Interaction::timeStamp).reversed());
-        return out;
-    }
-
-    private static void respondError(HttpExchange ex, int code, String err) throws IOException {
-        respondJson(ex, code, "{\"error\":\"" + escape(err) + "\"}");
-    }
-
-    private static void respondJson(HttpExchange ex, int code, String body) throws IOException {
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        ex.getResponseHeaders().set("Content-Type", CONTENT_TYPE_JSON);
-        ex.sendResponseHeaders(code, bytes.length);
-        try (OutputStream os = ex.getResponseBody()) {
-            os.write(bytes);
-        }
-    }
-
-    private static String readBody(HttpExchange ex) throws IOException {
-        try (InputStream is = ex.getRequestBody()) {
-            byte[] buf = is.readAllBytes();
-            return new String(buf, StandardCharsets.UTF_8);
+    private static void preflightBind(String host, int port) {
+        try (ServerSocket ss = new ServerSocket()) {
+            ss.setReuseAddress(true);
+            ss.bind(new InetSocketAddress(InetAddress.getByName(host), port));
+            Logger.logInfo("Preflight bind via ServerSocket SUCCEEDED for " + host + ":" + port + " (closing socket).");
+        } catch (Exception e) {
+            Logger.logError("Preflight bind via ServerSocket FAILED (" + e.getClass().getSimpleName() + "): " + e.getMessage());
         }
     }
 
@@ -455,8 +433,8 @@ public final class HttpBridgeServer {
         Map<String, String> m = new HashMap<>();
         for (String pair : raw.split("&")) {
             int idx = pair.indexOf('=');
-            String k = idx >= 0 ? pair.substring(0, idx) : pair;
-            String v = idx >= 0 ? pair.substring(idx + 1) : "";
+            String k = (idx >= 0) ? pair.substring(0, idx) : pair;
+            String v = (idx >= 0) ? pair.substring(idx + 1) : "";
             m.put(urlDecode(k), urlDecode(v));
         }
         return m;
@@ -465,22 +443,20 @@ public final class HttpBridgeServer {
     private static String urlDecode(String s) {
         try {
             return URLDecoder.decode(s, StandardCharsets.UTF_8);
-        } catch (Exception e) {
+        } catch (Exception _ ) {
             return s;
         }
     }
 
-    // Minimal flat JSON object parser: {"k":"v",...} → Map<String,String>.
     private static Map<String, String> parseJsonObjectFlat(String body) {
-        final String b = body == null ? "" : body.trim();
-        if (b.length() < 2 || b.charAt(0) != '{' || b.charAt(b.length() - 1) != '}') {
-            return Collections.emptyMap();
-        }
+        String b = (body == null) ? "" : body.trim();
+        if (b.length() < 2 || b.charAt(0) != '{' || b.charAt(b.length() - 1) != '}') return Collections.emptyMap();
+
         String inner = b.substring(1, b.length() - 1).trim();
         if (inner.isEmpty()) return Collections.emptyMap();
 
         List<String> parts = splitTopLevel(inner);
-        Map<String, String> out = new HashMap<>(Math.max(4, parts.size()));
+        Map<String, String> out = new HashMap<>();
         for (String p : parts) {
             int idx = p.indexOf(':');
             if (idx < 0) continue;
@@ -498,10 +474,10 @@ public final class HttpBridgeServer {
         StringBuilder token = new StringBuilder(s.length());
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
-            if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) {
+            boolean quoteToggle = (c == '"' && (i == 0 || s.charAt(i - 1) != '\\'));
+            if (quoteToggle) {
                 depth ^= 1;
-            }
-            if (c == ',' && depth == 0) {
+            } else if (c == ',' && depth == 0) {
                 parts.add(token.toString());
                 token.setLength(0);
             } else {
@@ -524,6 +500,43 @@ public final class HttpBridgeServer {
         return (s == null) ? "" : s.trim();
     }
 
+    private static Integer parsePositiveInt(String s) {
+        if (s.isEmpty()) return null;
+        try {
+            int v = Integer.parseInt(s);
+            return (v > 0) ? v : null;
+        } catch (NumberFormatException _ ) {
+            return null;
+        }
+    }
+
+    private static Set<String> parseTypes(String csv) {
+        if (csv.isEmpty()) return Collections.emptySet();
+        Set<String> out = new HashSet<>();
+        for (String t : csv.split(",")) {
+            String v = t.trim();
+            if (!v.isEmpty()) out.add(v);
+        }
+        return out;
+    }
+
+    private static List<Interaction> fetchInteractions(CollaboratorClient c, String byPayload, String byId) {
+        if (!byPayload.isEmpty()) return c.getInteractions(InteractionFilter.interactionPayloadFilter(byPayload));
+        if (!byId.isEmpty()) return c.getInteractions(InteractionFilter.interactionIdFilter(byId));
+        return c.getAllInteractions();
+    }
+
+    private static List<Interaction> filterInteractions(List<Interaction> in, ZonedDateTime since, Set<String> types) {
+        List<Interaction> out = new ArrayList<>(in.size());
+        for (Interaction i : in) {
+            boolean timeOk = (since == null) || !i.timeStamp().isBefore(since);
+            boolean typeOk = types.isEmpty() || types.contains(classifyType(i));
+            if (timeOk && typeOk) out.add(i);
+        }
+        out.sort(Comparator.comparing(Interaction::timeStamp).reversed());
+        return out;
+    }
+
     private static ZonedDateTime parseSince(String raw) {
         try {
             if (raw.matches("^\\d{10,}$")) {
@@ -532,13 +545,13 @@ public final class HttpBridgeServer {
                 return ZonedDateTime.ofInstant(Instant.ofEpochMilli(ms), ZonedDateTime.now().getZone());
             }
             return ZonedDateTime.parse(raw);
-        } catch (DateTimeParseException | NumberFormatException e) {
+        } catch (DateTimeParseException | NumberFormatException _ ) {
             return null;
         }
     }
 
     private static String classifyType(Interaction i) {
-        if (i.dnsDetails().isPresent())  return "dns";
+        if (i.dnsDetails().isPresent()) return "dns";
         if (i.httpDetails().isPresent()) return "http";
         if (i.smtpDetails().isPresent()) return "smtp";
         return "unknown";
@@ -596,5 +609,10 @@ public final class HttpBridgeServer {
             }
         }
         return b.toString();
+    }
+
+    @SuppressWarnings("HttpUrlsUsage")
+    private static String httpUrlForLog(String host, int port) {
+        return "http://" + host + ":" + port;
     }
 }

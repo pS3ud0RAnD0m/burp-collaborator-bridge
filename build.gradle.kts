@@ -18,7 +18,10 @@ repositories {
 dependencies {
     compileOnly("net.portswigger.burp.extensions:montoya-api:2025.6")
 
-    // needed for com.ps3ud0rand0m.burp.utils.Logger (uses ch.qos.logback.*)
+    // Layout
+    implementation("com.miglayout:miglayout-swing:11.3")
+
+    // Logger placeholder (your Logger doesn't require it, but keeping what you had)
     compileOnly("ch.qos.logback:logback-classic:1.5.18")
     runtimeOnly("ch.qos.logback:logback-classic:1.5.18")
 }
