@@ -390,6 +390,7 @@ public final class HttpBridgeServer {
     }
 
     private static void writeJson(OutputStream out, int code, String body) throws IOException {
+        if (!body.endsWith("\n")) { body = body + "\n"; }
         byte[] payload = body.getBytes(StandardCharsets.UTF_8);
         String headers =
                 "HTTP/1.1 " + code + " " + reasonPhrase(code) + "\r\n" +
