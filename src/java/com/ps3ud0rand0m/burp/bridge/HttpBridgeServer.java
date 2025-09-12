@@ -5,11 +5,11 @@ import com.ps3ud0rand0m.burp.utils.Logger;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.collaborator.CollaboratorClient;
 import burp.api.montoya.collaborator.CollaboratorPayload;
+import burp.api.montoya.collaborator.DnsDetails;
+import burp.api.montoya.collaborator.HttpDetails;
 import burp.api.montoya.collaborator.Interaction;
 import burp.api.montoya.collaborator.InteractionFilter;
 import burp.api.montoya.collaborator.PayloadOption;
-import burp.api.montoya.collaborator.DnsDetails;
-import burp.api.montoya.collaborator.HttpDetails;
 import burp.api.montoya.collaborator.SmtpDetails;
 import burp.api.montoya.http.message.HttpHeader;
 
@@ -43,25 +43,21 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Tiny HTTP/1.1 bridge exposing Burp Collaborator via plain JSON.
+ * Tiny HTTP/1.1 bridge exposing Burp Collaborator via JSON.
  *
  * <p><strong>Endpoints</strong></p>
  * <ul>
- *   <li>{@code GET /health} – liveness probe</li>
- *   <li>{@code GET|POST /payloads} – create a {@link CollaboratorPayload}; supports
- *       {@code custom} (alnum ≤16) and {@code without_server=1}</li>
- *   <li>{@code GET /interactions} – list interactions; optional filters:
- *       {@code payload}, {@code id}, {@code since}, {@code types}, {@code limit}</li>
+ *   <li>{@code GET /health}</li>
+ *   <li>{@code GET|POST /payloads} — create a payload; supports {@code custom} (alnum ≤16) and {@code without_server=1}</li>
+ *   <li>{@code GET /interactions} — list interactions; optional filters: {@code payload}, {@code id}, {@code since}, {@code types}, {@code limit}</li>
  * </ul>
  *
- * <p><strong>Threading</strong> – Not thread-safe overall; external callers interact on a single
- * instance through {@link #start()} / {@link #stop()} guarded by {@code stateLock}. Each connection
- * is handled in a worker thread from a fixed pool. Swing/EDT is not involved here.</p>
+ * <p><strong>Threading</strong></p>
+ * Single instance guarded by {@code stateLock}. Each connection handled by a worker thread.
  *
- * <p><strong>Failure model</strong> – I/O and parse errors return JSON with HTTP 4xx/5xx.
- * If Collaborator is disabled or unavailable, endpoints respond with 503 ({@code error:
- * "collaborator_disabled"}). JSON bodies always end with a single LF to keep CLI prompts on
- * the next line.</p>
+ * <p><strong>Failure model</strong></p>
+ * I/O/parse errors return 4xx/5xx. If Collaborator is disabled, endpoints return 503 with {@code error: 'collaborator_disabled'}.
+ * JSON bodies always end with a single LF.
  */
 public final class HttpBridgeServer {
 
@@ -73,7 +69,7 @@ public final class HttpBridgeServer {
     private static final int MAX_HEADERS = 200;
     private static final int MAX_BODY = 1_000_000; // 1MB cap for POST body
     private static final int ACCEPT_SO_TIMEOUT_MS = 0;      // blocking accept
-    private static final int SOCKET_SO_TIMEOUT_MS = 15_000; // read timeout per client
+    private static final int SOCKET_SO_TIMEOUT_MS = 15_000; // per-client read timeout
 
     private final MontoyaApi api;
     private final String bindHost;
@@ -87,24 +83,14 @@ public final class HttpBridgeServer {
     private ExecutorService executor;
     private Thread acceptThread;
 
-    /**
-     * Create a bridge bound to the provided host/port.
-     *
-     * @param api      Montoya API from the Burp extension
-     * @param bindHost local bind address (e.g., {@code 127.0.0.1})
-     * @param bindPort local TCP port
-     */
+    /** Create a bridge bound to the provided host/port. */
     public HttpBridgeServer(MontoyaApi api, String bindHost, int bindPort) {
         this.api = api;
         this.bindHost = bindHost;
         this.bindPort = bindPort;
     }
 
-    /**
-     * Start the server: create a Collaborator client, bind the socket, and spawn the accept loop.
-     *
-     * @throws IOException if binding fails
-     */
+    /** Start the server: create a Collaborator client, bind the socket, and spawn the accept loop. */
     public void start() throws IOException {
         synchronized (stateLock) {
             if (running) return;
@@ -137,10 +123,7 @@ public final class HttpBridgeServer {
         }
     }
 
-    /**
-     * Stop the server and worker pool; safe to call multiple times.
-     * Ensures any blocking {@code accept()} is unblocked via socket close.
-     */
+    /** Stop the server and worker pool; safe to call multiple times. */
     public void stop() {
         synchronized (stateLock) {
             running = false;
@@ -164,27 +147,22 @@ public final class HttpBridgeServer {
         }
     }
 
-    /** @return {@code true} once {@link #start()} has completed and until {@link #stop()}. */
     public boolean isRunning() {
         synchronized (stateLock) {
             return running;
         }
     }
 
-    /** @return configured bind host */
     public String bindHost() {
         return bindHost;
     }
 
-    /** @return configured bind port */
     public int bindPort() {
         return bindPort;
     }
 
     // --------------------- Accept loop ---------------------
 
-    // Worker that accepts sockets and hands off to the pool; runs until stop() flips 'running' or
-    // the ServerSocket is closed.
     private void acceptLoop() {
         Logger.logInfo("Accept loop started.");
         while (running) {
@@ -212,10 +190,7 @@ public final class HttpBridgeServer {
 
     // --------------------- Client handling ---------------------
 
-    /**
-     * Handle a single request/connection pair.
-     * <p>Protocol: one request per TCP connection, then we close.</p>
-     */
+    /** Handle a single request (one per TCP connection). */
     private void handleClient(Socket socket) {
         try (Socket s = socket;
              InputStream rawIn = new BufferedInputStream(s.getInputStream());
@@ -243,7 +218,6 @@ public final class HttpBridgeServer {
         }
     }
 
-    @SuppressWarnings("CognitiveComplexity")
     private void handlePayloads(HttpRequest req, OutputStream out) throws IOException {
         final CollaboratorClient c;
         synchronized (stateLock) { c = client; }
@@ -253,7 +227,6 @@ public final class HttpBridgeServer {
         }
 
         try {
-            // Merge query params with optional POST JSON (flat object) for convenience.
             Map<String, String> q = new HashMap<>(req.query());
             if ("POST".equals(req.method())) {
                 q.putAll(parseJsonObjectFlat(req.body()));
@@ -282,21 +255,14 @@ public final class HttpBridgeServer {
         } catch (IllegalStateException _ ) {
             writeJson(out, 503, errorJson(ERR_DISABLED));
         } catch (IllegalArgumentException bad) {
-            if ("invalid_custom".equals(bad.getMessage())) {
-                writeJson(out, 400, errorJson("invalid_custom"));
-            } else {
-                writeJson(out, 400, errorJson("bad_request"));
-            }
+            writeJson(out, 400, errorJson("invalid_custom".equals(bad.getMessage()) ? "invalid_custom" : "bad_request"));
         } catch (Exception e) {
             Logger.logError("payloads handler error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             writeJson(out, 500, errorJson("server_error"));
         }
     }
 
-    /**
-     * Build a payload from inputs. Validates {@code custom} as alnum ≤16 and respects
-     * {@code withoutServer}.
-     */
+    /** Build a payload from inputs. Validates {@code custom} as alnum ≤16 and respects {@code withoutServer}. */
     private static CollaboratorPayload createPayload(CollaboratorClient c, String custom, boolean withoutServer) {
         final String customValue = trimToEmpty(custom);
         if (!customValue.isEmpty()) {
@@ -312,7 +278,6 @@ public final class HttpBridgeServer {
                 : c.generatePayload();
     }
 
-    @SuppressWarnings("CognitiveComplexity")
     private void handleInteractions(HttpRequest req, OutputStream out) throws IOException {
         final CollaboratorClient c;
         synchronized (stateLock) { c = client; }
@@ -322,33 +287,13 @@ public final class HttpBridgeServer {
         }
 
         try {
-            Map<String, String> q = req.query();
-
-            String byPayload = trimToEmpty(q.get("payload"));
-            String byId      = trimToEmpty(q.get("id"));
-            String typesCsv  = trimToEmpty(q.get("types")).toLowerCase(Locale.ROOT);
-            Set<String> typeWhitelist = parseTypes(typesCsv);
-
-            ZonedDateTime since = null;
-            String sinceRaw = trimToEmpty(q.get("since"));
-            if (!sinceRaw.isEmpty()) {
-                since = parseSince(sinceRaw);
-                if (since == null) {
-                    writeJson(out, 400, errorJson("invalid_since"));
-                    return;
-                }
+            Filters f = filtersFromQuery(req.query());
+            if (f.invalidSince()) {
+                writeJson(out, 400, errorJson("invalid_since"));
+                return;
             }
 
-            Integer limit = parsePositiveInt(trimToEmpty(q.get("limit")));
-
-            List<Interaction> interactions = fetchInteractions(c, byPayload, byId);
-            List<Interaction> filtered = filterInteractions(interactions, since, typeWhitelist);
-            if (limit != null && filtered.size() > limit) {
-                filtered = filtered.subList(0, limit);
-            }
-
-            String json = interactionsToJson(filtered);
-            writeJson(out, 200, json);
+            writeJson(out, 200, listInteractionsJson(c, f));
         } catch (IllegalStateException _ ) {
             writeJson(out, 503, errorJson(ERR_DISABLED));
         } catch (Exception e) {
@@ -359,7 +304,7 @@ public final class HttpBridgeServer {
 
     // --------------------- HTTP helpers ---------------------
 
-    /** Lightweight request container parsed from the raw socket. */
+    /** Minimal container parsed from the raw socket. */
     private record HttpRequest(
             String method,
             String path,
@@ -369,13 +314,6 @@ public final class HttpBridgeServer {
             String body
     ) {}
 
-    /**
-     * Parse a single HTTP/1.1 request line + headers + optional body from the socket.
-     * Only Content-Length bodies are supported; chunked is intentionally out of scope.
-     *
-     * @param in buffered stream from the client socket
-     * @return parsed request or {@code null} when input is truncated/invalid
-     */
     private HttpRequest parseRequest(InputStream in) throws IOException {
         String start = readLine(in, MAX_START_LINE);
         if (start == null || start.isEmpty()) return null;
@@ -427,9 +365,6 @@ public final class HttpBridgeServer {
         return new HttpRequest(method, path, version, headers, parseQuery(rawQuery), body);
     }
 
-    /**
-     * Read an ASCII/UTF-8 line terminated by LF (CRLF tolerated). Returns {@code null} on EOF.
-     */
     private static String readLine(InputStream in, int maxLen) throws IOException {
         StringBuilder sb = new StringBuilder(80);
         int prev = -1;
@@ -449,13 +384,7 @@ public final class HttpBridgeServer {
         return sb.isEmpty() ? null : sb.toString();
     }
 
-    /**
-     * Write a JSON response with a trailing LF and a correct {@code Content-Length}.
-     *
-     * @param out  socket output
-     * @param code HTTP status
-     * @param body JSON body (LF appended if missing)
-     */
+    /** Write a JSON response with a trailing LF and a correct {@code Content-Length}. */
     private static void writeJson(OutputStream out, int code, String body) throws IOException {
         if (!body.endsWith("\n")) { body = body + "\n"; }
         byte[] payload = body.getBytes(StandardCharsets.UTF_8);
@@ -486,9 +415,6 @@ public final class HttpBridgeServer {
 
     // --------------------- Business helpers ---------------------
 
-    /**
-     * Quick bind attempt (create/bind/close) to surface errors early before starting the accept loop.
-     */
     private static void preflightBind(String host, int port) {
         try (ServerSocket ss = new ServerSocket()) {
             ss.setReuseAddress(true);
@@ -499,7 +425,6 @@ public final class HttpBridgeServer {
         }
     }
 
-    /** Parse the query-string into a flat {@code Map<String,String>}. */
     private static Map<String, String> parseQuery(String raw) {
         if (raw == null || raw.isEmpty()) return Collections.emptyMap();
         Map<String, String> m = new HashMap<>();
@@ -512,7 +437,6 @@ public final class HttpBridgeServer {
         return m;
     }
 
-    /** URL-decode with UTF-8; on error return the input unchanged. */
     private static String urlDecode(String s) {
         try {
             return URLDecoder.decode(s, StandardCharsets.UTF_8);
@@ -522,8 +446,8 @@ public final class HttpBridgeServer {
     }
 
     /**
-     * Extremely small JSON parser for a flat object like {@code {"k":"v"}}.
-     * No nested objects/arrays; used to avoid a JSON dependency in the extension.
+     * Flat JSON object parser used for POST bodies (no nesting).
+     * Example payload shown without quotes to avoid Javadoc parsing issues: {@code {k:v}}.
      */
     private static Map<String, String> parseJsonObjectFlat(String body) {
         String b = (body == null) ? "" : body.trim();
@@ -578,7 +502,6 @@ public final class HttpBridgeServer {
         return (s == null) ? "" : s.trim();
     }
 
-    /** @return a positive integer or {@code null} if absent/invalid/≤0. */
     private static Integer parsePositiveInt(String s) {
         if (s.isEmpty()) return null;
         try {
@@ -589,7 +512,6 @@ public final class HttpBridgeServer {
         }
     }
 
-    /** Parse a CSV of types (e.g., {@code dns,http}). */
     private static Set<String> parseTypes(String csv) {
         if (csv.isEmpty()) return Collections.emptySet();
         Set<String> out = new HashSet<>();
@@ -600,14 +522,49 @@ public final class HttpBridgeServer {
         return out;
     }
 
-    /** Fetch interactions with an optional payload or id filter. */
+    /** Parsed /interactions filters. */
+    private record Filters(String byPayload, String byId, Set<String> typeWhitelist,
+                           ZonedDateTime since, Integer limit, boolean invalidSince) {
+        // use generated accessors
+    }
+
+    private static Filters filtersFromQuery(Map<String, String> qRaw) {
+        Map<String, String> q = (qRaw == null) ? Collections.emptyMap() : qRaw;
+
+        String byPayload = trimToEmpty(q.get("payload"));
+        String byId = trimToEmpty(q.get("id"));
+
+        String typesCsv = trimToEmpty(q.get("types")).toLowerCase(Locale.ROOT);
+        Set<String> typeWhitelist = parseTypes(typesCsv);
+
+        String sinceRaw = trimToEmpty(q.get("since"));
+        ZonedDateTime since = null;
+        boolean bad = false;
+        if (!sinceRaw.isEmpty()) {
+            since = parseSince(sinceRaw);
+            bad = (since == null);
+        }
+
+        Integer limit = parsePositiveInt(trimToEmpty(q.get("limit")));
+
+        return new Filters(byPayload, byId, typeWhitelist, since, limit, bad);
+    }
+
+    private static String listInteractionsJson(CollaboratorClient c, Filters f) {
+        List<Interaction> interactions = fetchInteractions(c, f.byPayload(), f.byId());
+        List<Interaction> filtered = filterInteractions(interactions, f.since(), f.typeWhitelist());
+        if (f.limit() != null && filtered.size() > f.limit()) {
+            filtered = filtered.subList(0, f.limit());
+        }
+        return interactionsToJson(filtered);
+    }
+
     private static List<Interaction> fetchInteractions(CollaboratorClient c, String byPayload, String byId) {
         if (!byPayload.isEmpty()) return c.getInteractions(InteractionFilter.interactionPayloadFilter(byPayload));
         if (!byId.isEmpty()) return c.getInteractions(InteractionFilter.interactionIdFilter(byId));
         return c.getAllInteractions();
     }
 
-    /** Filter interactions by time and type; newest-first ordering. */
     private static List<Interaction> filterInteractions(List<Interaction> in, ZonedDateTime since, Set<String> types) {
         List<Interaction> out = new ArrayList<>(in.size());
         for (Interaction i : in) {
@@ -619,11 +576,6 @@ public final class HttpBridgeServer {
         return out;
     }
 
-    /**
-     * Parse a {@code since} parameter. Accepts epoch seconds/millis (10+/13 digits) or ISO-8601.
-     *
-     * @return parsed time, or {@code null} if format is invalid
-     */
     private static ZonedDateTime parseSince(String raw) {
         try {
             if (raw.matches("^\\d{10,}$")) {
@@ -644,148 +596,157 @@ public final class HttpBridgeServer {
         return "unknown";
     }
 
-    /**
-     * Serialize all available details for each interaction.
-     *
-     * <p>Includes both parsed fields and raw payloads (base64) where applicable and preserves
-     * the original top-level fields for backward compatibility.</p>
-     */
-    @SuppressWarnings("CognitiveComplexity")
+    /** Serialize a list of interactions by delegating each item to {@link #interactionToJson(Interaction)}. */
     private static String interactionsToJson(List<Interaction> list) {
         StringJoiner j = new StringJoiner(",", "[", "]");
         for (Interaction i : list) {
-            StringBuilder sb = new StringBuilder(256);
-            sb.append('{');
-            jsonField(sb, "id", i.id().toString());
-            sb.append(',');
-            jsonField(sb, "type", i.type().name().toLowerCase(Locale.ROOT));
-            sb.append(',');
-            jsonField(sb, "timestamp", i.timeStamp().toString());
-            sb.append(',');
-            jsonField(sb, "clientIp", i.clientIp().getHostAddress());
-            sb.append(',');
-            sb.append("\"clientPort\":").append(i.clientPort());
-
-            i.customData().ifPresent(cd -> {
-                sb.append(',');
-                jsonField(sb, "customData", cd);
-            });
-
-            sb.append(',');
-            jsonField(sb, "hasDns", i.dnsDetails().isPresent());
-            sb.append(',');
-            jsonField(sb, "hasHttp", i.httpDetails().isPresent());
-            sb.append(',');
-            jsonField(sb, "hasSmtp", i.smtpDetails().isPresent());
-
-            // DNS details (raw + parsed)
-            i.dnsDetails().ifPresent((DnsDetails dd) -> {
-                sb.append(',');
-                sb.append("\"dns\":{");
-                jsonField(sb, "queryType", dd.queryType().name());
-                sb.append(',');
-                byte[] raw = dd.query().getBytes();
-                jsonField(sb, "qname", decodeDnsQname(raw));
-                sb.append(',');
-                jsonField(sb, "rawQueryBase64", base64(raw));
-                sb.append('}');
-            });
-
-            // HTTP details (service + request + response + timing when present)
-            i.httpDetails().ifPresent((HttpDetails hd) -> {
-                sb.append(',');
-                sb.append("\"http\":{");
-
-                // protocol
-                jsonField(sb, "protocol", hd.protocol().name());
-
-                // request/response
-                sb.append(',');
-                sb.append("\"service\":{");
-                burp.api.montoya.http.message.HttpRequestResponse rr = hd.requestResponse();
-
-                // Prefer request.httpService() for host/port/secure.
-                burp.api.montoya.http.message.requests.HttpRequest req = rr.request();
-                burp.api.montoya.http.HttpService svc = req.httpService();
-                jsonField(sb, "host", svc.host());
-                sb.append(',');
-                sb.append("\"port\":").append(svc.port());
-                sb.append(',');
-                jsonField(sb, "secure", svc.secure());
-                sb.append('}');
-
-                // request
-                sb.append(',');
-                sb.append("\"request\":{");
-                jsonField(sb, "method", req.method());
-                sb.append(',');
-                jsonField(sb, "httpVersion", req.httpVersion());
-                sb.append(',');
-                jsonField(sb, "path", req.path());
-                sb.append(',');
-                jsonField(sb, "pathWithoutQuery", req.pathWithoutQuery());
-                sb.append(',');
-                jsonField(sb, "query", req.query());
-                sb.append(',');
-                jsonField(sb, "url", req.url());
-                sb.append(',');
-                // common chunk: headers + bodyBase64 + rawBase64
-                appendHeadersBodyRaw(sb, req.headers(), req.body().getBytes(), req.toByteArray().getBytes());
-                sb.append('}');
-
-                // response (if present)
-                if (rr.hasResponse()) {
-                    burp.api.montoya.http.message.responses.HttpResponse resp = rr.response();
-                    sb.append(',');
-                    sb.append("\"response\":{");
-                    sb.append("\"statusCode\":").append(resp.statusCode());
-                    sb.append(',');
-                    jsonField(sb, "reasonPhrase", resp.reasonPhrase());
-                    sb.append(',');
-                    appendHeadersBodyRaw(sb, resp.headers(), resp.body().getBytes(), resp.toByteArray().getBytes());
-                    sb.append('}');
-                }
-
-                // timing data (optional on some implementations)
-                try {
-                    rr.timingData().ifPresent(td -> {
-                        sb.append(',');
-                        sb.append("\"timing\":{");
-                        jsonField(sb, "timeRequestSent", td.timeRequestSent().toString());
-                        sb.append(',');
-                        jsonField(sb, "timeToFirstByte",
-                                td.timeBetweenRequestSentAndStartOfResponse() == null ? "" :
-                                        td.timeBetweenRequestSentAndStartOfResponse().toString());
-                        sb.append(',');
-                        jsonField(sb, "timeToLastByte",
-                                td.timeBetweenRequestSentAndEndOfResponse() == null ? "" :
-                                        td.timeBetweenRequestSentAndEndOfResponse().toString());
-                        sb.append('}');
-                    });
-                } catch (Exception _ ) {
-                    // Some RR implementations may not expose timing data; ignore safely.
-                }
-
-                sb.append('}');
-            });
-
-            // SMTP details
-            i.smtpDetails().ifPresent((SmtpDetails sd) -> {
-                sb.append(',');
-                sb.append("\"smtp\":{");
-                jsonField(sb, "protocol", sd.protocol().name());
-                sb.append(',');
-                jsonField(sb, "conversation", sd.conversation());
-                sb.append('}');
-            });
-
-            sb.append('}');
-            j.add(sb.toString());
+            j.add(interactionToJson(i));
         }
         return j.toString();
     }
 
-    /** Emit "headers", "bodyBase64", and "rawBase64" in that order. */
+    /** Serialize one interaction (kept small; helpers handle per-type detail). */
+    private static String interactionToJson(Interaction i) {
+        StringBuilder sb = new StringBuilder(256);
+        sb.append('{');
+        jsonField(sb, "id", i.id().toString());
+        sb.append(',');
+        jsonField(sb, "type", i.type().name().toLowerCase(Locale.ROOT));
+        sb.append(',');
+        jsonField(sb, "timestamp", i.timeStamp().toString());
+        sb.append(',');
+        jsonField(sb, "clientIp", i.clientIp().getHostAddress());
+        sb.append(',');
+        sb.append("\"clientPort\":").append(i.clientPort());
+
+        i.customData().ifPresent(cd -> {
+            sb.append(',');
+            jsonField(sb, "customData", cd);
+        });
+
+        sb.append(',');
+        jsonField(sb, "hasDns", i.dnsDetails().isPresent());
+        sb.append(',');
+        jsonField(sb, "hasHttp", i.httpDetails().isPresent());
+        sb.append(',');
+        jsonField(sb, "hasSmtp", i.smtpDetails().isPresent());
+
+        i.dnsDetails().ifPresent(dd -> appendDns(sb, dd));
+        i.httpDetails().ifPresent(hd -> appendHttp(sb, hd));
+        i.smtpDetails().ifPresent(sd -> appendSmtp(sb, sd));
+
+        sb.append('}');
+        return sb.toString();
+    }
+
+    /** Append DNS block. */
+    private static void appendDns(StringBuilder sb, DnsDetails dd) {
+        sb.append(',');
+        sb.append("\"dns\":{");
+        jsonField(sb, "queryType", dd.queryType().name());
+        sb.append(',');
+        byte[] raw = dd.query().getBytes();
+        jsonField(sb, "qname", decodeDnsQname(raw));
+        sb.append(',');
+        jsonField(sb, "rawQueryBase64", base64(raw));
+        sb.append('}');
+    }
+
+    /** Append HTTP block (service + request + optional response + optional timing). */
+    private static void appendHttp(StringBuilder sb, HttpDetails hd) {
+        sb.append(',');
+        sb.append("\"http\":{");
+        jsonField(sb, "protocol", hd.protocol().name());
+
+        burp.api.montoya.http.message.HttpRequestResponse rr = hd.requestResponse();
+        burp.api.montoya.http.message.requests.HttpRequest req = rr.request();
+
+        sb.append(',');
+        appendServiceBlock(sb, req);
+        sb.append(',');
+        appendRequestBlock(sb, req);
+
+        if (rr.hasResponse()) {
+            sb.append(',');
+            appendResponseBlock(sb, rr.response());
+        }
+
+        appendTimingBlock(sb, rr);
+
+        sb.append('}');
+    }
+
+    private static void appendServiceBlock(StringBuilder sb, burp.api.montoya.http.message.requests.HttpRequest req) {
+        sb.append("\"service\":{");
+        burp.api.montoya.http.HttpService svc = req.httpService();
+        jsonField(sb, "host", svc.host());
+        sb.append(',');
+        sb.append("\"port\":").append(svc.port());
+        sb.append(',');
+        jsonField(sb, "secure", svc.secure());
+        sb.append('}');
+    }
+
+    private static void appendRequestBlock(StringBuilder sb, burp.api.montoya.http.message.requests.HttpRequest req) {
+        sb.append("\"request\":{");
+        jsonField(sb, "method", req.method());
+        sb.append(',');
+        jsonField(sb, "httpVersion", req.httpVersion());
+        sb.append(',');
+        jsonField(sb, "path", req.path());
+        sb.append(',');
+        jsonField(sb, "pathWithoutQuery", req.pathWithoutQuery());
+        sb.append(',');
+        jsonField(sb, "query", req.query());
+        sb.append(',');
+        jsonField(sb, "url", req.url());
+        sb.append(',');
+        appendHeadersBodyRaw(sb, req.headers(), req.body().getBytes(), req.toByteArray().getBytes());
+        sb.append('}');
+    }
+
+    private static void appendResponseBlock(StringBuilder sb, burp.api.montoya.http.message.responses.HttpResponse resp) {
+        sb.append("\"response\":{");
+        sb.append("\"statusCode\":").append(resp.statusCode());
+        sb.append(',');
+        jsonField(sb, "reasonPhrase", resp.reasonPhrase());
+        sb.append(',');
+        appendHeadersBodyRaw(sb, resp.headers(), resp.body().getBytes(), resp.toByteArray().getBytes());
+        sb.append('}');
+    }
+
+    private static void appendTimingBlock(StringBuilder sb, burp.api.montoya.http.message.HttpRequestResponse rr) {
+        try {
+            rr.timingData().ifPresent(td -> {
+                sb.append(',');
+                sb.append("\"timing\":{");
+                jsonField(sb, "timeRequestSent", td.timeRequestSent().toString());
+                sb.append(',');
+                jsonField(sb, "timeToFirstByte",
+                        td.timeBetweenRequestSentAndStartOfResponse() == null ? "" :
+                                td.timeBetweenRequestSentAndStartOfResponse().toString());
+                sb.append(',');
+                jsonField(sb, "timeToLastByte",
+                        td.timeBetweenRequestSentAndEndOfResponse() == null ? "" :
+                                td.timeBetweenRequestSentAndEndOfResponse().toString());
+                sb.append('}');
+            });
+        } catch (Exception _ ) {
+            // Some RR implementations may not expose timing data; ignore safely.
+        }
+    }
+
+    /** Append SMTP block. */
+    private static void appendSmtp(StringBuilder sb, SmtpDetails sd) {
+        sb.append(',');
+        sb.append("\"smtp\":{");
+        jsonField(sb, "protocol", sd.protocol().name());
+        sb.append(',');
+        jsonField(sb, "conversation", sd.conversation());
+        sb.append('}');
+    }
+
+    /** Emit fields "headers", "bodyBase64", and "rawBase64" in that order. */
     private static void appendHeadersBodyRaw(StringBuilder sb, List<HttpHeader> headers, byte[] body, byte[] raw) {
         sb.append("\"headers\":").append(headersArray(headers));
         sb.append(',');
@@ -794,7 +755,7 @@ public final class HttpBridgeServer {
         jsonField(sb, "rawBase64", base64(raw));
     }
 
-    /** Serialize HTTP headers as an array of {@code {"name","value"}} objects. */
+    /** Serialize HTTP headers as an array of objects with fields {@code name} and {@code value}. */
     private static String headersArray(List<HttpHeader> headers) {
         StringJoiner j = new StringJoiner(",", "[", "]");
         for (HttpHeader h : headers) {
@@ -815,11 +776,10 @@ public final class HttpBridgeServer {
     }
 
     /**
-     * Minimal DNS QNAME decoder (supports standard compression).
-     * Safe bounds and loop guard to avoid malformed-packet traps.
+     * Minimal DNS QNAME decoder (supports compression). Safe bounds and loop guard.
      *
      * @param msg full DNS message bytes
-     * @return the first question name or empty on error
+     * @return question name or empty on error
      */
     private static String decodeDnsQname(byte[] msg) {
         if (msg == null || msg.length < 12) return "";
@@ -827,16 +787,14 @@ public final class HttpBridgeServer {
         Set<Integer> visited = new HashSet<>();
         int current = 12;
         int safety = 0;
+        boolean jumped = false;
         boolean done = false;
 
         while (!done && current < msg.length && safety++ < 512) {
             int len = msg[current] & 0xFF;
 
-            if (len == 0) {
-                // normal end of name; advance past the zero if we were not following a pointer
-                done = true;
-            } else if ((len & 0xC0) == 0xC0) {
-                // compression pointer
+            if ((len & 0xC0) == 0xC0) {
+                // pointer
                 if (current + 1 >= msg.length) {
                     done = true;
                 } else {
@@ -844,12 +802,14 @@ public final class HttpBridgeServer {
                     if (ptr >= msg.length || !visited.add(ptr)) {
                         done = true;
                     } else {
-                        current = ptr; // jump
-                        continue;      // single continue keeps style rule happy
+                        if (!jumped) jumped = true;
+                        current = ptr;
                     }
                 }
+            } else if (len == 0) {
+                done = true;
+                current++; // advance past zero
             } else {
-                // label of length 'len'
                 int end = current + 1 + len;
                 if (end > msg.length) {
                     done = true;
@@ -857,11 +817,8 @@ public final class HttpBridgeServer {
                     if (!name.isEmpty()) name.append('.');
                     name.append(new String(msg, current + 1, len, StandardCharsets.UTF_8));
                     current = end;
-                    continue;
                 }
             }
-            // advance one byte if we reached a zero label and weren't jumping
-            if (len == 0) current++;
         }
         return name.toString();
     }
@@ -874,7 +831,7 @@ public final class HttpBridgeServer {
         sb.append('"').append(escape(k)).append("\":").append(v ? "true" : "false");
     }
 
-    /** String escape for JSON (minimal subset required by our output). */
+    /** String escape for JSON (minimal subset used here). */
     private static String escape(String s) {
         StringBuilder b = new StringBuilder(s.length() + 16);
         for (int i = 0; i < s.length(); i++) {

@@ -60,7 +60,7 @@ public final class Logger {
                     } else {
                         l.logToOutput(line);
                     }
-                } catch (RuntimeException ignored) {
+                } catch (RuntimeException _) {
                     disabled = true; // fail closed for Burp logging only
                 }
             }
@@ -70,7 +70,7 @@ public final class Logger {
             try {
                 if (error) s.error(line);
                 else s.info(line);
-            } catch (RuntimeException ignored) {
+            } catch (RuntimeException _) {
                 // ignore faulty sinks
             }
         }

@@ -21,15 +21,21 @@ public class CollaboratorBridge implements BurpExtension {
             CollaboratorBridgePanel panel = new CollaboratorBridgePanel(api);
             api.userInterface().registerSuiteTab("Collaborator Bridge", panel);
 
-            try {
-                api.extension().registerUnloadingHandler(panel::stopAllOnUnload);
-            } catch (Throwable ignored) {
-                // Older Montoya builds may not expose an unloading hook.
-            }
+            // Some Montoya builds may not expose an unloading hook; register if available.
+            safeRegisterUnload(api, panel);
 
             Logger.logInfo("Initialized successfully.");
         } catch (Exception e) {
             Logger.logError("Initialization failed: " + e.getMessage());
+        }
+    }
+
+    /** Attempt to register an unload handler; ignore if the API is not available on this build. */
+    private static void safeRegisterUnload(MontoyaApi api, CollaboratorBridgePanel panel) {
+        try {
+            api.extension().registerUnloadingHandler(panel::stopAllOnUnload);
+        } catch (Exception _) {
+            // Unloading hook not supported; nothing to do.
         }
     }
 }

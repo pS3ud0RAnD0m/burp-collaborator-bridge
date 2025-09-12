@@ -34,6 +34,7 @@ public class ConfigPanel extends JPanel implements Logger.Sink {
 
     private static final String DEFAULT_HOST = "127.0.0.1";
     private static final String DEFAULT_PORT = "8090";
+    private static final String MIG_ALIGN_LEFT = "alignx left";
 
     private final transient MontoyaApi api;
 
@@ -86,11 +87,11 @@ public class ConfigPanel extends JPanel implements Logger.Sink {
         startButton.addActionListener(this::onStartClicked);
         stopButton.addActionListener(this::onStopClicked);
 
-        p.add(startButton, "alignx left");
-        p.add(stopButton, "alignx left");
+        p.add(startButton, MIG_ALIGN_LEFT);
+        p.add(stopButton, MIG_ALIGN_LEFT);
 
-        p.add(statusDot, "alignx left");
-        p.add(statusLabel, "alignx left");
+        p.add(statusDot, MIG_ALIGN_LEFT);
+        p.add(statusLabel, MIG_ALIGN_LEFT);
 
         return p;
     }

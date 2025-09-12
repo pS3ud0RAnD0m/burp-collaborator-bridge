@@ -18,7 +18,6 @@ public class CollaboratorBridgePanel extends JPanel {
     private static final long serialVersionUID = 1L;
 
     private final ConfigPanel configPanel;
-    private final AboutPanel aboutPanel;
 
     public CollaboratorBridgePanel(MontoyaApi api) {
         setLayout(new BorderLayout());
@@ -27,7 +26,7 @@ public class CollaboratorBridgePanel extends JPanel {
         // Mirror ALL Logger output into the Config tab.
         Logger.addSink(configPanel);
 
-        aboutPanel = new AboutPanel();
+        AboutPanel aboutPanel = new AboutPanel();
 
         JTabbedPane tabs = new JTabbedPane();
         tabs.addTab("Config", configPanel);
