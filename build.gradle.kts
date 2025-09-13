@@ -1,3 +1,6 @@
+import org.gradle.language.jvm.tasks.ProcessResources
+import org.gradle.jvm.tasks.Jar
+
 plugins {
     java
 }
@@ -16,14 +19,16 @@ repositories {
 }
 
 dependencies {
-    compileOnly("net.portswigger.burp.extensions:montoya-api:2025.6")
+    // compileOnly
+    compileOnly(libs.montoya)
+    compileOnly(libs.logbackClassic)
 
-    // Layout
-    implementation("com.miglayout:miglayout-swing:11.3")
+    // implementation
+    implementation(libs.miglayoutSwing)
+    implementation(libs.flexmarkAll)
 
-    // Logger placeholder (your Logger doesn't require it, but keeping what you had)
-    compileOnly("ch.qos.logback:logback-classic:1.5.18")
-    runtimeOnly("ch.qos.logback:logback-classic:1.5.18")
+    // runtimeOnly
+    runtimeOnly(libs.logbackClassic)
 }
 
 sourceSets {
@@ -32,7 +37,13 @@ sourceSets {
     }
 }
 
-tasks.register<org.gradle.jvm.tasks.Jar>("fatJar") {
+tasks.named<ProcessResources>("processResources") {
+    from(rootProject.layout.projectDirectory.files("README.md", "LICENSE")) {
+        into("")
+    }
+}
+
+tasks.register<Jar>("fatJar") {
     group = "build"
     description = "Assembles a fat JAR containing compiled classes and runtime dependencies for Burp."
     val base = (findProperty("archivesBaseName") as String?) ?: project.name
@@ -54,7 +65,7 @@ tasks.register<org.gradle.jvm.tasks.Jar>("fatJar") {
     })
 }
 
-tasks.named<org.gradle.jvm.tasks.Jar>("jar") {
+tasks.named<Jar>("jar") {
     enabled = false
 }
 

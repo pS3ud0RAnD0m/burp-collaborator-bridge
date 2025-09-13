@@ -66,7 +66,7 @@ public class ConfigPanel extends JPanel implements Logger.Sink {
 
         setRunning(false);
 
-        info("Endpoints: /health, /payloads, /interactions");
+        info("Endpoints:\n  /health\n  /payload\n  /interactions");
         info("Example: " + httpUrl(hostField.getText(), Integer.parseInt(portField.getText()), "/health"));
     }
 
@@ -214,7 +214,6 @@ public class ConfigPanel extends JPanel implements Logger.Sink {
     }
 
     /** Builds an HTTP URL string for local use. */
-    @SuppressWarnings("HttpUrlsUsage")
     private static String httpUrl(String host, int port, String path) {
         String p = (path == null) ? "" : path;
         return "http://" + host + ":" + port + p;

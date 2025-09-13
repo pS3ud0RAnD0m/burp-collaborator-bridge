@@ -47,7 +47,7 @@ import java.util.concurrent.Executors;
  * <p><strong>Endpoints</strong></p>
  * <ul>
  *   <li>{@code GET /health}</li>
- *   <li>{@code GET|POST /payloads} — create a payload; supports {@code custom} (alnum ≤16) and {@code without_server=1}</li>
+ *   <li>{@code GET|POST /payload} — create a payload; supports {@code custom} (alnum ≤16) and {@code without_server=1}</li>
  *   <li>{@code GET /interactions} — return all interactions seen by this bridge instance
  *       (append-only retention). Each item includes {@code "new":true|false} to indicate whether
  *       it arrived in the current request.</li>
@@ -218,8 +218,8 @@ public final class HttpBridgeServer {
                 case "/health":
                     writeJson(rawOut, 200, "{\"status\":\"ok\"}");
                     return;
-                case "/payloads":
-                    handlePayloads(req, rawOut);
+                case "/payload":
+                    handlePayload(req, rawOut);
                     return;
                 case "/interactions":
                     handleInteractions(req, rawOut);
@@ -232,7 +232,7 @@ public final class HttpBridgeServer {
         }
     }
 
-    private void handlePayloads(HttpRequest req, OutputStream out) throws IOException {
+    private void handlePayload(HttpRequest req, OutputStream out) throws IOException {
         final CollaboratorClient c;
         synchronized (stateLock) { c = client; }
         if (c == null) {
@@ -257,7 +257,7 @@ public final class HttpBridgeServer {
         } catch (IllegalArgumentException bad) {
             writeJson(out, 400, errorJson("invalid_custom".equals(bad.getMessage()) ? "invalid_custom" : "bad_request"));
         } catch (Exception e) {
-            Logger.logError("payloads handler error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            Logger.logError("payload handler error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             writeJson(out, 500, errorJson("server_error"));
         }
     }
@@ -873,7 +873,6 @@ public final class HttpBridgeServer {
         return b.toString();
     }
 
-    @SuppressWarnings("HttpUrlsUsage")
     private static String httpUrlForLog(String host, int port) {
         return "http://" + host + ":" + port;
     }

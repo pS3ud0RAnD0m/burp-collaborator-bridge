@@ -1,0 +1,11 @@
+[versions]
+montoya = "2025.6"
+miglayout = "11.3"
+logback = "1.5.18"
+flexmark = "0.64.8"
+
+[libraries]
+montoya = { group = "net.portswigger.burp.extensions", name = "montoya-api", version.ref = "montoya" }
+miglayoutSwing = { group = "com.miglayout", name = "miglayout-swing", version.ref = "miglayout" }
+logbackClassic = { group = "ch.qos.logback", name = "logback-classic", version.ref = "logback" }
+flexmarkAll = { group = "com.vladsch.flexmark", name = "flexmark-all", version.ref = "flexmark" }
