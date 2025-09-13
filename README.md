@@ -4,6 +4,12 @@ This Burp Suite extension exposes a simple API to bridge Python scripts to Burp 
 
 ## Usage
 
+1. Load the jar within Burp.
+2. Navigate to the 'Collaborator Bridge' tab.
+3. Set/Confirm the 'Host' and 'Port'.
+4. Click the 'Start' button.
+5. Use with Python as described below.
+
 Get extension's health
 ```
 curl -s http://localhost:8090/health
