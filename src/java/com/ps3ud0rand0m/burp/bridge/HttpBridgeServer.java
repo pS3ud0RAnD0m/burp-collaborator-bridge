@@ -8,7 +8,6 @@ import burp.api.montoya.collaborator.CollaboratorPayload;
 import burp.api.montoya.collaborator.DnsDetails;
 import burp.api.montoya.collaborator.HttpDetails;
 import burp.api.montoya.collaborator.Interaction;
-import burp.api.montoya.collaborator.InteractionFilter;
 import burp.api.montoya.collaborator.PayloadOption;
 import burp.api.montoya.collaborator.SmtpDetails;
 import burp.api.montoya.http.message.HttpHeader;
@@ -49,15 +48,17 @@ import java.util.concurrent.Executors;
  * <ul>
  *   <li>{@code GET /health}</li>
  *   <li>{@code GET|POST /payloads} — create a payload; supports {@code custom} (alnum ≤16) and {@code without_server=1}</li>
- *   <li>{@code GET /interactions} — list interactions; optional filters: {@code payload}, {@code id}, {@code since}, {@code types}, {@code limit}</li>
+ *   <li>{@code GET /interactions} — return all interactions seen by this bridge instance
+ *       (append-only retention). Each item includes {@code "new":true|false} to indicate whether
+ *       it arrived in the current request.</li>
  * </ul>
  *
  * <p><strong>Threading</strong></p>
- * Single instance guarded by {@code stateLock}. Each connection handled by a worker thread.
+ * Single instance guarded by {@code stateLock}. Per-connection handling uses a worker thread.
  *
  * <p><strong>Failure model</strong></p>
- * I/O/parse errors return 4xx/5xx. If Collaborator is disabled, endpoints return 503 with {@code error: 'collaborator_disabled'}.
- * JSON bodies always end with a single LF.
+ * I/O/parse errors return 4xx/5xx. If Collaborator is disabled, endpoints return 503 with
+ * {@code error:'collaborator_disabled'}. JSON bodies always end with a single LF.
  */
 public final class HttpBridgeServer {
 
@@ -82,6 +83,19 @@ public final class HttpBridgeServer {
     private ServerSocket serverSocket;
     private ExecutorService executor;
     private Thread acceptThread;
+
+    // ---------------- Retention (append-only, no filtering) ----------------
+    /**
+     * Retained interactions and their first-seen sequence number. The sequence increments once
+     * per /interactions request that actually receives fresh items from Collaborator.
+     */
+    private final Object cacheLock = new Object();
+    private final Map<String, Cached> cache = new HashMap<>(); // key -> cached
+    private long pollSeq = 0L; // incremented when new items arrive in a request
+
+    /** Minimal holder for retention. */
+    private record Cached(Interaction it, long seq) { }
+    // ----------------------------------------------------------------------
 
     /** Create a bridge bound to the provided host/port. */
     public HttpBridgeServer(MontoyaApi api, String bindHost, int bindPort) {
@@ -237,21 +251,7 @@ public final class HttpBridgeServer {
 
             CollaboratorPayload payload = createPayload(c, custom, withoutServer);
 
-            StringBuilder sb = new StringBuilder(128);
-            sb.append('{');
-            jsonField(sb, "payload", payload.toString());
-            sb.append(',');
-            jsonField(sb, "id", payload.id().toString());
-            payload.customData().ifPresent(cd -> {
-                sb.append(',');
-                jsonField(sb, "customData", cd);
-            });
-            payload.server().ifPresent(loc -> {
-                sb.append(',');
-                jsonField(sb, "serverLocation", loc.toString());
-            });
-            sb.append('}');
-            writeJson(out, 200, sb.toString());
+            writeJson(out, 200, payloadJson(payload));
         } catch (IllegalStateException _ ) {
             writeJson(out, 503, errorJson(ERR_DISABLED));
         } catch (IllegalArgumentException bad) {
@@ -293,7 +293,11 @@ public final class HttpBridgeServer {
                 return;
             }
 
-            writeJson(out, 200, listInteractionsJson(c, f));
+            // 1) Poll once; append fresh results to retention.
+            long currentSeq = pollAndRetain(c);
+
+            // 2) Return full retained set (no filtering), marking "new" for this request.
+            writeJson(out, 200, listInteractionsJsonFromRetention(currentSeq));
         } catch (IllegalStateException _ ) {
             writeJson(out, 503, errorJson(ERR_DISABLED));
         } catch (Exception e) {
@@ -302,7 +306,7 @@ public final class HttpBridgeServer {
         }
     }
 
-    // --------------------- HTTP helpers ---------------------
+    // --------------------- HTTP parse helpers ---------------------
 
     /** Minimal container parsed from the raw socket. */
     private record HttpRequest(
@@ -318,24 +322,15 @@ public final class HttpBridgeServer {
         String start = readLine(in, MAX_START_LINE);
         if (start == null || start.isEmpty()) return null;
 
-        String[] parts = start.split(" ", 3);
-        if (parts.length < 3) return null;
-        String method  = parts[0].toUpperCase(Locale.ROOT);
+        String[] parts = splitRequestLine(start);
+        if (parts == null) return null;
+
+        String method  = parts[0];
         String uri     = parts[1];
         String version = parts[2];
 
-        Map<String, String> headers = new HashMap<>();
-        for (int i = 0; i < MAX_HEADERS; i++) {
-            String line = readLine(in, MAX_HEADER_LINE);
-            if (line == null) return null;
-            if (line.isEmpty()) break;
-            int idx = line.indexOf(':');
-            if (idx > 0) {
-                String k = line.substring(0, idx).trim().toLowerCase(Locale.ROOT);
-                String v = line.substring(idx + 1).trim();
-                headers.put(k, v);
-            }
-        }
+        Map<String, String> headers = readHeaders(in);
+        if (headers == null) return null;
 
         String path = uri;
         String rawQuery = null;
@@ -363,6 +358,30 @@ public final class HttpBridgeServer {
         }
 
         return new HttpRequest(method, path, version, headers, parseQuery(rawQuery), body);
+    }
+
+    /** Split the request line into 3 parts; return null if malformed. */
+    private static String[] splitRequestLine(String start) {
+        String[] parts = start.split(" ", 3);
+        return (parts.length < 3) ? null : new String[] { parts[0].toUpperCase(Locale.ROOT), parts[1], parts[2] };
+    }
+
+    /** Read headers until a blank line; null if EOF encountered unexpectedly. */
+    @SuppressWarnings("java:S1168")
+    private static Map<String, String> readHeaders(InputStream in) throws IOException {
+        Map<String, String> headers = new HashMap<>();
+        for (int i = 0; i < MAX_HEADERS; i++) {
+            String line = readLine(in, MAX_HEADER_LINE);
+            if (line == null) return null; // sentinel for truncated/EOF before CRLFCRLF
+            if (line.isEmpty()) break;
+            int idx = line.indexOf(':');
+            if (idx > 0) {
+                String k = line.substring(0, idx).trim().toLowerCase(Locale.ROOT);
+                String v = line.substring(idx + 1).trim();
+                headers.put(k, v);
+            }
+        }
+        return headers;
     }
 
     private static String readLine(InputStream in, int maxLen) throws IOException {
@@ -445,10 +464,7 @@ public final class HttpBridgeServer {
         }
     }
 
-    /**
-     * Flat JSON object parser used for POST bodies (no nesting).
-     * Example payload shown without quotes to avoid Javadoc parsing issues: {@code {k:v}}.
-     */
+    /** Flat JSON object parser used for POST bodies (no nesting). */
     private static Map<String, String> parseJsonObjectFlat(String body) {
         String b = (body == null) ? "" : body.trim();
         if (b.length() < 2 || b.charAt(0) != '{' || b.charAt(b.length() - 1) != '}') return Collections.emptyMap();
@@ -522,13 +538,12 @@ public final class HttpBridgeServer {
         return out;
     }
 
-    /** Parsed /interactions filters. */
+    /** Parsed /interactions filters (parsed only to validate; not used to filter output). */
     private record Filters(String byPayload, String byId, Set<String> typeWhitelist,
-                           ZonedDateTime since, Integer limit, boolean invalidSince) {
-        // use generated accessors
-    }
+                           ZonedDateTime since, Integer limit, boolean invalidSince) { }
 
     private static Filters filtersFromQuery(Map<String, String> qRaw) {
+        // Parse/validate inputs to keep request semantics stable (e.g., invalid_since).
         Map<String, String> q = (qRaw == null) ? Collections.emptyMap() : qRaw;
 
         String byPayload = trimToEmpty(q.get("payload"));
@@ -550,30 +565,56 @@ public final class HttpBridgeServer {
         return new Filters(byPayload, byId, typeWhitelist, since, limit, bad);
     }
 
-    private static String listInteractionsJson(CollaboratorClient c, Filters f) {
-        List<Interaction> interactions = fetchInteractions(c, f.byPayload(), f.byId());
-        List<Interaction> filtered = filterInteractions(interactions, f.since(), f.typeWhitelist());
-        if (f.limit() != null && filtered.size() > f.limit()) {
-            filtered = filtered.subList(0, f.limit());
+    /**
+     * Poll Collaborator once and append any fresh interactions to retention.
+     * @return the current sequence number used to tag "new" items for this request;
+     *         if nothing new arrived, returns {@code -1}.
+     */
+    private long pollAndRetain(CollaboratorClient c) {
+        List<Interaction> fresh;
+        try {
+            fresh = c.getAllInteractions(); // poll (consumes new/unread items)
+        } catch (Exception e) {
+            Logger.logError("Collaborator poll failed: " + e.getMessage());
+            return -1;
         }
-        return interactionsToJson(filtered);
+        if (fresh == null || fresh.isEmpty()) return -1;
+
+        long seq;
+        synchronized (cacheLock) {
+            seq = ++pollSeq;
+            final long s = seq; // effectively final for lambda capture
+            for (Interaction it : fresh) {
+                String key = keyOf(it);
+                // putIfAbsent avoids the "unused lambda parameter" warning from computeIfAbsent
+                cache.putIfAbsent(key, new Cached(it, s));
+            }
+        }
+        return seq;
     }
 
-    private static List<Interaction> fetchInteractions(CollaboratorClient c, String byPayload, String byId) {
-        if (!byPayload.isEmpty()) return c.getInteractions(InteractionFilter.interactionPayloadFilter(byPayload));
-        if (!byId.isEmpty()) return c.getInteractions(InteractionFilter.interactionIdFilter(byId));
-        return c.getAllInteractions();
+    /** Compose a stable key for dedupe across polls. */
+    private static String keyOf(Interaction it) {
+        return it.id() + "|" + it.type().name() + "|" + it.timeStamp() + "|" +
+                it.clientIp().getHostAddress() + ":" + it.clientPort();
     }
 
-    private static List<Interaction> filterInteractions(List<Interaction> in, ZonedDateTime since, Set<String> types) {
-        List<Interaction> out = new ArrayList<>(in.size());
-        for (Interaction i : in) {
-            boolean timeOk = (since == null) || !i.timeStamp().isBefore(since);
-            boolean typeOk = types.isEmpty() || types.contains(classifyType(i));
-            if (timeOk && typeOk) out.add(i);
+    /** Build JSON from retention (all items), tagging those first seen in {@code currentSeq} as {@code "new":true}. */
+    private String listInteractionsJsonFromRetention(long currentSeq) {
+        List<Cached> snapshot;
+        synchronized (cacheLock) {
+            snapshot = new ArrayList<>(cache.values());
         }
-        out.sort(Comparator.comparing(Interaction::timeStamp).reversed());
-        return out;
+
+        // newest-first
+        snapshot.sort(Comparator.comparing((Cached c) -> c.it.timeStamp()).reversed());
+
+        StringJoiner j = new StringJoiner(",", "[", "]");
+        for (Cached c : snapshot) {
+            boolean isNew = (currentSeq != -1) && (c.seq == currentSeq);
+            j.add(interactionToJson(c.it, isNew));
+        }
+        return j.toString();
     }
 
     private static ZonedDateTime parseSince(String raw) {
@@ -589,24 +630,8 @@ public final class HttpBridgeServer {
         }
     }
 
-    private static String classifyType(Interaction i) {
-        if (i.dnsDetails().isPresent()) return "dns";
-        if (i.httpDetails().isPresent()) return "http";
-        if (i.smtpDetails().isPresent()) return "smtp";
-        return "unknown";
-    }
-
-    /** Serialize a list of interactions by delegating each item to {@link #interactionToJson(Interaction)}. */
-    private static String interactionsToJson(List<Interaction> list) {
-        StringJoiner j = new StringJoiner(",", "[", "]");
-        for (Interaction i : list) {
-            j.add(interactionToJson(i));
-        }
-        return j.toString();
-    }
-
-    /** Serialize one interaction (kept small; helpers handle per-type detail). */
-    private static String interactionToJson(Interaction i) {
+    /** Serialize one interaction (helpers handle per-type detail). */
+    private static String interactionToJson(Interaction i, boolean isNew) {
         StringBuilder sb = new StringBuilder(256);
         sb.append('{');
         jsonField(sb, "id", i.id().toString());
@@ -618,6 +643,8 @@ public final class HttpBridgeServer {
         jsonField(sb, "clientIp", i.clientIp().getHostAddress());
         sb.append(',');
         sb.append("\"clientPort\":").append(i.clientPort());
+        sb.append(',');
+        jsonField(sb, "new", isNew);
 
         i.customData().ifPresent(cd -> {
             sb.append(',');
@@ -776,49 +803,47 @@ public final class HttpBridgeServer {
     }
 
     /**
-     * Minimal DNS QNAME decoder (supports compression). Safe bounds and loop guard.
-     *
-     * @param msg full DNS message bytes
-     * @return question name or empty on error
+     * Minimal DNS QNAME decoder (supports compression). Implemented with early returns (no break/continue clutter).
      */
     private static String decodeDnsQname(byte[] msg) {
         if (msg == null || msg.length < 12) return "";
-        StringBuilder name = new StringBuilder();
-        Set<Integer> visited = new HashSet<>();
-        int current = 12;
-        int safety = 0;
-        boolean jumped = false;
-        boolean done = false;
+        return readDnsName(msg, 12, new HashSet<>());
+    }
 
-        while (!done && current < msg.length && safety++ < 512) {
+    /**
+     * Recursive helper for DNS name decoding.
+     * Stops on zero-length label or compression pointer; bounds guarded.
+     */
+    private static String readDnsName(byte[] msg, int pos, Set<Integer> visited) {
+        StringBuilder name = new StringBuilder();
+        int current = pos;
+        int safety = 0;
+
+        while (current < msg.length && safety++ < 512) {
             int len = msg[current] & 0xFF;
 
+            // end of name
+            if (len == 0) return name.toString();
+
+            // compression pointer
             if ((len & 0xC0) == 0xC0) {
-                // pointer
-                if (current + 1 >= msg.length) {
-                    done = true;
-                } else {
-                    int ptr = ((len & 0x3F) << 8) | (msg[current + 1] & 0xFF);
-                    if (ptr >= msg.length || !visited.add(ptr)) {
-                        done = true;
-                    } else {
-                        if (!jumped) jumped = true;
-                        current = ptr;
-                    }
-                }
-            } else if (len == 0) {
-                done = true;
-                current++; // advance past zero
-            } else {
-                int end = current + 1 + len;
-                if (end > msg.length) {
-                    done = true;
-                } else {
+                if (current + 1 >= msg.length) return name.toString();
+                int ptr = ((len & 0x3F) << 8) | (msg[current + 1] & 0xFF);
+                if (ptr >= msg.length || !visited.add(ptr)) return name.toString();
+                String pointed = readDnsName(msg, ptr, visited);
+                if (!pointed.isEmpty()) {
                     if (!name.isEmpty()) name.append('.');
-                    name.append(new String(msg, current + 1, len, StandardCharsets.UTF_8));
-                    current = end;
+                    name.append(pointed);
                 }
+                return name.toString(); // pointer terminates the name
             }
+
+            // regular label
+            int end = current + 1 + len;
+            if (end > msg.length) return name.toString();
+            if (!name.isEmpty()) name.append('.');
+            name.append(new String(msg, current + 1, len, StandardCharsets.UTF_8));
+            current = end;
         }
         return name.toString();
     }
@@ -851,5 +876,25 @@ public final class HttpBridgeServer {
     @SuppressWarnings("HttpUrlsUsage")
     private static String httpUrlForLog(String host, int port) {
         return "http://" + host + ":" + port;
+    }
+
+    // --------------------- payload helpers ---------------------
+
+    private static String payloadJson(CollaboratorPayload p) {
+        StringBuilder sb = new StringBuilder(128);
+        sb.append('{');
+        jsonField(sb, "payload", p.toString());
+        sb.append(',');
+        jsonField(sb, "id", p.id().toString());
+        p.customData().ifPresent(cd -> {
+            sb.append(',');
+            jsonField(sb, "customData", cd);
+        });
+        p.server().ifPresent(loc -> {
+            sb.append(',');
+            jsonField(sb, "serverLocation", loc.toString());
+        });
+        sb.append('}');
+        return sb.toString();
     }
 }
