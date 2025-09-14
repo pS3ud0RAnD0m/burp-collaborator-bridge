@@ -30,7 +30,7 @@ Get new interactions (new since last /interactions call)
 curl -s http://localhost:8090/interactions |jq '[ .[] |select(.new == true) ]'
 ```
 
-Note: This extension tracks historic interactions within memory. To clear interactions, reload the extension.
+Note: This extension tracks historic interactions within memory. To clear interactions, restart the API server or reload the extension.
 
 ## License
 
