@@ -1,3 +1,23 @@
-.idea/ 
-.gradle/ 
-build/
+# Ignore everything by default
+*
+!*/
+
+# Explicitly allow project files
+!.gitignore
+!.github/**
+!LICENSE
+!README.md
+
+# Gradle wrapper and build files
+!build.gradle.kts
+!settings.gradle.kts
+!gradlew
+!gradlew.bat
+!gradle.properties
+!gradle/**
+
+# Source code
+!src/**
+
+# Prevent VCS tracking
+.idea/
